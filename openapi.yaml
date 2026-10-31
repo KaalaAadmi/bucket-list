@@ -1,0 +1,326 @@
+openapi: 3.1.0
+info:
+  title: bucket-list
+  version: 0.1.0
+  description: >
+    Media storage service. Bytes go straight between the caller and Cloudflare R2 via
+    signed links; this API decides, signs and records. Every route except /v1/health
+    and /v1/cron/cleanup needs `Authorization: Bearer <API key>`; /v1/keys needs the
+    ADMIN_TOKEN or a key with the admin scope. Errors are
+    `{ "error": { "code": "...", "message": "..." } }`.
+servers:
+  - url: https://{project}.vercel.app
+    variables: { project: { default: bucket-list } }
+security: [{ apiKey: [] }]
+
+paths:
+  /v1/health:
+    get:
+      security: []
+      responses:
+        "200": { description: Up, content: { application/json: { schema: { type: object, properties: { ok: { type: boolean }, version: { type: string } } } } } }
+
+  /v1/uploads:
+    post:
+      summary: Start an upload, resume one, or report a duplicate (scope write)
+      description: >
+        Checks the external ID first, then the content hash within the collection. Same
+        bytes already stored → duplicate (and the external ID is attached if the stored
+        asset had none: adopted). Same bytes still uploading → resume.
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/CreateUpload" } } }
+      responses:
+        "200": { description: Duplicate, content: { application/json: { schema: { $ref: "#/components/schemas/UploadResult" } } } }
+        "201": { description: "Single, multipart or resume", content: { application/json: { schema: { $ref: "#/components/schemas/UploadResult" } } } }
+        "400": { $ref: "#/components/responses/Error" }
+        "413": { $ref: "#/components/responses/Error" }
+        "415": { $ref: "#/components/responses/Error" }
+
+  /v1/uploads/{id}:
+    parameters: [{ $ref: "#/components/parameters/id" }]
+    get:
+      summary: Resume state of an upload (scope write); duplicate if it already finished
+      responses:
+        "200": { description: State, content: { application/json: { schema: { $ref: "#/components/schemas/UploadResult" } } } }
+        "404": { $ref: "#/components/responses/Error" }
+    delete:
+      summary: Cancel an unfinished upload (scope delete)
+      responses:
+        "204": { description: Cancelled }
+        "409": { $ref: "#/components/responses/Error" }
+
+  /v1/uploads/{id}/parts:
+    parameters: [{ $ref: "#/components/parameters/id" }]
+    post:
+      summary: Signed URLs for parts of a multipart upload (scope write)
+      requestBody:
+        content:
+          application/json:
+            schema: { type: object, required: [partNumbers], properties: { partNumbers: { type: array, minItems: 1, maxItems: 100, items: { type: integer, minimum: 1 } } } }
+      responses:
+        "200":
+          description: URLs, valid 15 minutes
+          content:
+            application/json:
+              schema: { type: object, properties: { parts: { type: array, items: { type: object, properties: { partNumber: { type: integer }, url: { type: string } } } } } }
+
+  /v1/uploads/{id}/complete:
+    parameters: [{ $ref: "#/components/parameters/id" }]
+    post:
+      summary: Finish an upload (scope write). Idempotent.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                parts: { type: array, description: Every part with its ETag; omit for single uploads, items: { type: object, required: [partNumber, etag], properties: { partNumber: { type: integer }, etag: { type: string } } } }
+      responses:
+        "200": { description: Uploaded, content: { application/json: { schema: { type: object, properties: { asset: { $ref: "#/components/schemas/Asset" } } } } } }
+        "409": { $ref: "#/components/responses/Error" }
+        "422": { description: Size in R2 differs from the declared size; the upload was discarded, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+
+  /v1/assets:
+    get:
+      summary: List, newest first (scope read)
+      parameters:
+        - { name: collection, in: query, schema: { type: string } }
+        - { name: kind, in: query, schema: { type: string, enum: [photo, video, file] } }
+        - { name: status, in: query, schema: { type: string, enum: [uploaded, uploading], default: uploaded } }
+        - { name: before, in: query, description: The `next` cursor from the previous page, schema: { type: string } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 100, default: 48 } }
+        - { name: urls, in: query, description: "`original` or a variant name; adds a 1-hour `url` to each item (falls back to the original)", schema: { type: string } }
+      responses:
+        "200":
+          description: Page
+          content:
+            application/json:
+              schema: { type: object, properties: { items: { type: array, items: { $ref: "#/components/schemas/Asset" } }, next: { type: [string, "null"] } } }
+
+  /v1/assets/urls:
+    post:
+      summary: Signed links for up to 100 assets (scope read)
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [items]
+              properties:
+                items: { type: array, maxItems: 100, items: { type: object, required: [id], properties: { id: { type: string }, variant: { type: string } } } }
+                expiresIn: { type: integer, minimum: 60, maximum: 86400 }
+      responses:
+        "200":
+          description: Links (null for unknown or unfinished assets)
+          content:
+            application/json:
+              schema: { type: object, properties: { urls: { type: array, items: { type: object, properties: { id: { type: string }, url: { type: [string, "null"] } } } }, expiresAt: { type: string } } }
+
+  /v1/assets/{id}:
+    parameters: [{ $ref: "#/components/parameters/id" }]
+    get:
+      summary: One asset (scope read). Another app's asset is a 404.
+      responses:
+        "200": { description: Asset, content: { application/json: { schema: { type: object, properties: { asset: { $ref: "#/components/schemas/Asset" } } } } } }
+        "404": { $ref: "#/components/responses/Error" }
+    patch:
+      summary: Update details (scope write). The R2 key never changes.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                metadata: { type: object, description: Replaced, not merged; up to 4 KB }
+                takenAt: { type: [string, "null"], format: date-time }
+                collection: { type: string }
+                filename: { type: string }
+                contentHash: { type: string, pattern: "^[0-9a-f]{64}$" }
+                externalId: { type: string }
+      responses:
+        "200": { description: Updated, content: { application/json: { schema: { type: object, properties: { asset: { $ref: "#/components/schemas/Asset" } } } } } }
+        "409": { description: Hash or external ID already used, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+    delete:
+      summary: Delete the original, every variant and the record (scope delete)
+      responses:
+        "204": { description: Deleted }
+
+  /v1/assets/{id}/url:
+    parameters: [{ $ref: "#/components/parameters/id" }]
+    post:
+      summary: Signed link (scope read)
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                variant: { type: string, description: "A variant name; omit or `original` for the original (or the proxy if the original was dropped)" }
+                download: { type: boolean, description: Save under the original filename }
+                expiresIn: { type: integer, minimum: 60, maximum: 86400, default: 3600 }
+      responses:
+        "200": { description: Link, content: { application/json: { schema: { type: object, properties: { url: { type: string }, expiresAt: { type: string } } } } } }
+
+  /v1/assets/{id}/merge:
+    parameters: [{ $ref: "#/components/parameters/id" }]
+    post:
+      summary: Fold another asset into this one (scopes write and delete)
+      description: >
+        This asset's ID survives. keepOriginal "from" moves the other asset's original
+        into this one (no bytes copied). The losing original and the other asset's
+        variants are deleted. Both must be uploaded, in the same collection, same kind.
+      requestBody:
+        content:
+          application/json:
+            schema: { type: object, required: [from, keepOriginal], properties: { from: { type: string }, keepOriginal: { type: string, enum: [this, from] } } }
+      responses:
+        "200": { description: Merged, content: { application/json: { schema: { type: object, properties: { asset: { $ref: "#/components/schemas/Asset" } } } } } }
+
+  /v1/assets/{id}/variants:
+    parameters: [{ $ref: "#/components/parameters/id" }]
+    post:
+      summary: Signed PUT for a derived file such as `thumb` or `proxy` (scope write)
+      requestBody:
+        content:
+          application/json:
+            schema: { type: object, required: [name, contentType, size], properties: { name: { type: string }, contentType: { type: string }, size: { type: integer } } }
+      responses:
+        "201": { description: Link, content: { application/json: { schema: { type: object, properties: { url: { type: string }, headers: { type: object }, expiresAt: { type: string } } } } } }
+
+  /v1/assets/{id}/variants/{name}/complete:
+    parameters: [{ $ref: "#/components/parameters/id" }, { name: name, in: path, required: true, schema: { type: string } }]
+    post:
+      summary: Finish a variant after its PUT (scope write)
+      responses:
+        "200": { description: Asset, content: { application/json: { schema: { type: object, properties: { asset: { $ref: "#/components/schemas/Asset" } } } } } }
+
+  /v1/assets/{id}/variants/{name}:
+    parameters: [{ $ref: "#/components/parameters/id" }, { name: name, in: path, required: true, schema: { type: string } }]
+    delete:
+      summary: Remove a variant (scope delete)
+      responses:
+        "200": { description: Asset, content: { application/json: { schema: { type: object, properties: { asset: { $ref: "#/components/schemas/Asset" } } } } } }
+
+  /v1/assets/{id}/original:
+    parameters: [{ $ref: "#/components/parameters/id" }]
+    delete:
+      summary: Drop the original once a `proxy` variant exists (scope delete)
+      responses:
+        "200": { description: Asset, content: { application/json: { schema: { type: object, properties: { asset: { $ref: "#/components/schemas/Asset" } } } } } }
+        "409": { $ref: "#/components/responses/Error" }
+
+  /v1/usage:
+    get:
+      summary: Bytes and counts for the key's app (scope read)
+      responses:
+        "200":
+          description: Usage
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  bytes: { type: integer }
+                  objects: { type: integer }
+                  photos: { type: integer }
+                  videos: { type: integer }
+                  files: { type: integer }
+                  byCollection: { type: array, items: { type: object, properties: { collection: { type: string }, bytes: { type: integer }, objects: { type: integer } } } }
+                  freeTierBytes: { type: integer }
+
+  /v1/keys:
+    post:
+      summary: Create an API key (admin). The key is returned only here.
+      requestBody:
+        content:
+          application/json:
+            schema: { type: object, required: [app, name, scopes], properties: { app: { type: string }, name: { type: string }, scopes: { type: array, items: { type: string, enum: [read, write, delete, admin] } } } }
+      responses:
+        "201": { description: Key, content: { application/json: { schema: { allOf: [{ $ref: "#/components/schemas/ApiKey" }, { type: object, properties: { key: { type: string } } }] } } } }
+    get:
+      summary: List keys without secrets (admin)
+      parameters: [{ name: app, in: query, schema: { type: string } }]
+      responses:
+        "200": { description: Keys, content: { application/json: { schema: { type: object, properties: { keys: { type: array, items: { $ref: "#/components/schemas/ApiKey" } } } } } } }
+
+  /v1/keys/{id}:
+    parameters: [{ $ref: "#/components/parameters/id" }]
+    delete:
+      summary: Revoke a key (admin)
+      responses:
+        "204": { description: Revoked }
+
+  /v1/cron/cleanup:
+    get:
+      summary: "Daily cleanup (Vercel Cron, `Authorization: Bearer $CRON_SECRET`)"
+      security: []
+      responses:
+        "200": { description: Done, content: { application/json: { schema: { type: object, properties: { staleUploadsRemoved: { type: integer }, orphansRemoved: { type: integer } } } } } }
+
+components:
+  securitySchemes:
+    apiKey: { type: http, scheme: bearer, description: "rsk_<id>_<secret>" }
+  parameters:
+    id: { name: id, in: path, required: true, schema: { type: string } }
+  responses:
+    Error: { description: Error, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+  schemas:
+    Error:
+      type: object
+      properties: { error: { type: object, properties: { code: { type: string }, message: { type: string } } } }
+    CreateUpload:
+      type: object
+      required: [collection, filename, size]
+      properties:
+        collection: { type: string, pattern: "^[a-z0-9][a-z0-9-]{0,31}$" }
+        filename: { type: string }
+        contentType: { type: string, description: Resolved from the extension when missing or generic }
+        size: { type: integer }
+        contentHash: { type: string, pattern: "^[0-9a-f]{64}$", description: SHA-256 of the bytes; needed for duplicates and resuming }
+        externalId: { type: string, description: "ID in the source, e.g. a Photos UUID; unique per app" }
+        takenAt: { type: string, format: date-time }
+        metadata: { type: object, description: "Any JSON, up to 4 KB" }
+        maxBytes: { type: integer }
+        kinds: { type: array, items: { type: string, enum: [photo, video, file] } }
+    UploadResult:
+      oneOf:
+        - { type: object, properties: { mode: { const: duplicate }, assetId: { type: string }, adopted: { type: boolean } } }
+        - { type: object, properties: { mode: { const: single }, assetId: { type: string }, url: { type: string }, headers: { type: object } } }
+        - { type: object, properties: { mode: { const: multipart }, assetId: { type: string }, partSize: { type: integer }, partCount: { type: integer } } }
+        - type: object
+          properties:
+            mode: { const: resume }
+            assetId: { type: string }
+            partSize: { type: integer }
+            partCount: { type: integer }
+            uploadedParts: { type: array, items: { type: object, properties: { partNumber: { type: integer }, etag: { type: string }, size: { type: integer } } } }
+    Asset:
+      type: object
+      properties:
+        id: { type: string }
+        collection: { type: string }
+        filename: { type: string }
+        contentType: { type: string }
+        kind: { type: string, enum: [photo, video, file] }
+        size: { type: integer }
+        contentHash: { type: [string, "null"] }
+        externalId: { type: [string, "null"] }
+        takenAt: { type: [string, "null"] }
+        status: { type: string, enum: [uploading, uploaded] }
+        hasOriginal: { type: boolean }
+        metadata: { type: object }
+        variants: { type: array, items: { type: object, properties: { name: { type: string }, contentType: { type: string }, size: { type: integer }, status: { type: string } } } }
+        createdAt: { type: string }
+        updatedAt: { type: string }
+        url: { type: [string, "null"], description: Only on list results with `urls=` }
+    ApiKey:
+      type: object
+      properties:
+        id: { type: string }
+        app: { type: string }
+        name: { type: string }
+        scopes: { type: array, items: { type: string } }
+        createdAt: { type: string }
+        lastUsedAt: { type: [string, "null"] }
+        revokedAt: { type: [string, "null"] }

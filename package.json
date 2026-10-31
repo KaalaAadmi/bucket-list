@@ -1,0 +1,30 @@
+{
+  "name": "bucket-list",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Media storage service: direct uploads to Cloudflare R2, an asset registry in MongoDB, signed links, variants and usage.",
+  "type": "module",
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "dev": "tsx watch src/dev.ts",
+    "start:memory": "STORE=memory tsx src/dev.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test --test-concurrency=1 test/*.test.ts",
+    "smoke": "tsx scripts/smoke.ts",
+    "create-key": "tsx scripts/create-key.ts",
+    "import:shot-listed": "tsx scripts/import-shot-listed.ts"
+  },
+  "dependencies": {
+    "@aws-sdk/client-s3": "3.1152.0",
+    "@aws-sdk/s3-request-presigner": "3.1152.0",
+    "hono": "4.13.13",
+    "mongodb": "7.7.0",
+    "zod": "4.6.7"
+  },
+  "devDependencies": {
+    "@hono/node-server": "2.1.5",
+    "@types/node": "22.20.5",
+    "tsx": "4.23.15",
+    "typescript": "5.9.3"
+  }
+}
