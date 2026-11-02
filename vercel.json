@@ -1,8 +1,8 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "functions": {
-    "src/index.ts": { "maxDuration": 300 }
+    "api/index.ts": { "maxDuration": 300 }
   },
-  "rewrites": [{ "source": "/(.*)", "destination": "/src/index.ts" }],
+  "rewrites": [{ "source": "/(.*)", "destination": "/api" }],
   "crons": [{ "path": "/v1/cron/cleanup", "schedule": "0 3 * * *" }]
 }
