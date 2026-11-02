@@ -12,6 +12,8 @@ const mongoUri = process.env.MONGODB_TEST_URI;
 const cleanups: Array<() => Promise<void>> = [];
 after(async () => {
   for (const c of cleanups) await c();
+  // The Mongo client is cached and shared, so close it once, after every database is dropped.
+  if (mongoUri) await (await (await import("../src/store/mongo.js")).connect(mongoUri)).close();
 });
 
 function asset(over: Partial<AssetRecord> = {}): AssetRecord {
@@ -47,9 +49,7 @@ if (mongoUri) {
       const dbName = `r2_storage_test_${Date.now()}_${Math.floor(Math.random() * 1e6)}`;
       const s = await mongoStore(mongoUri, dbName);
       cleanups.push(async () => {
-        const client = await connect(mongoUri);
-        await client.db(dbName).dropDatabase();
-        await client.close();
+        await (await connect(mongoUri)).db(dbName).dropDatabase();
       });
       return s;
     },
